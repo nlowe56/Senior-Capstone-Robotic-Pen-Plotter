@@ -1,0 +1,259 @@
+// Native ESP-IDF C++ migration of StepperPlotter v0.6
+// Target: ESP32-S3. Prototype: calibrate motion and verify wiring before enabling motors.
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <deque>
+#include <cmath>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "nvs_flash.h"
+#include "esp_rom_sys.h"
+
+static constexpr gpio_num_t X_STEP=GPIO_NUM_4, X_DIR=GPIO_NUM_5, X_EN=GPIO_NUM_6;
+static constexpr gpio_num_t Y_STEP=GPIO_NUM_7, Y_DIR=GPIO_NUM_15, Y_EN=GPIO_NUM_16;
+static constexpr gpio_num_t X_LIMIT=GPIO_NUM_17, Y_LIMIT=GPIO_NUM_18;
+static constexpr gpio_num_t X_FAULT=GPIO_NUM_11, Y_FAULT=GPIO_NUM_12;
+static constexpr gpio_num_t PEN_SERVO=GPIO_NUM_8, GRIP_SERVO=GPIO_NUM_10, STATUS_LED=GPIO_NUM_9;
+static constexpr int X_MAX=200, Y_MAX=200, HOME_MAX=200;
+static constexpr unsigned STEP_DELAY_US=1000, HOME_DELAY_US=2000;
+static constexpr int PEN_UP=90, PEN_DOWN=45, GRIP_OPEN=90, GRIP_CLOSE=45;
+static constexpr size_t QUEUE_MAX=100, COMMAND_MAX=63;
+static constexpr char AP_SSID[]="Insert ID here", AP_PASS[]="Insert password here";
+static const char* TAG="StepperPlotter";
+static SemaphoreHandle_t lock;
+static std::deque<std::string> queue;
+static std::atomic<bool> stop_requested{false};
+static std::atomic<bool> drawing{false};
+static std::atomic<bool> homed{false};
+static std::atomic<bool> enabled{false};
+static std::atomic<long> pos_x{0}, pos_y{0};
+static bool servos_ready=false;
+
+static bool x_limit(){return gpio_get_level(X_LIMIT)==1;} // NC switches, pullup; open = triggered
+static bool y_limit(){return gpio_get_level(Y_LIMIT)==1;}
+static bool motor_fault(){return gpio_get_level(X_FAULT)==0 || gpio_get_level(Y_FAULT)==0;}
+static void motors_off(){gpio_set_level(X_EN,1);gpio_set_level(Y_EN,1);enabled=false;}
+static bool motors_on(){if(motor_fault()){ESP_LOGE(TAG,"DRV8825 fault");return false;}
+  gpio_set_level(X_EN,0);gpio_set_level(Y_EN,0);enabled=true;return true;}
+static void clear_queue(){xSemaphoreTake(lock,portMAX_DELAY);queue.clear();xSemaphoreGive(lock);}
+static void request_stop(){stop_requested=true;clear_queue();}
+static void abort_motion(){homed=false;motors_off();drawing=false;clear_queue();}
+static std::string normalize(std::string s){
+  auto begin=s.find_first_not_of(" \r\n\t");if(begin==std::string::npos)return "";
+  auto end=s.find_last_not_of(" \r\n\t");s=s.substr(begin,end-begin+1);
+  for(char &c:s)c=static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  return s;
+}
+static bool enqueue(const std::string& cmd){
+  std::string s=normalize(cmd);if(s.empty()||s.size()>COMMAND_MAX)return false;
+  xSemaphoreTake(lock,portMAX_DELAY);bool ok=queue.size()<QUEUE_MAX;if(ok)queue.push_back(s);xSemaphoreGive(lock);return ok;
+}
+static void pulse(bool x,bool y,unsigned wait_us){
+  if (x) {
+    gpio_set_level(X_STEP, 1);
+  }
+  if (y) {
+    gpio_set_level(Y_STEP, 1);
+  }
+  esp_rom_delay_us(wait_us);
+  if (x) {
+    gpio_set_level(X_STEP, 0);
+  }
+  if (y) {
+    gpio_set_level(Y_STEP, 0);
+  }
+  esp_rom_delay_us(wait_us);
+}
+static bool move_to(long tx,long ty){
+  if(!homed||!enabled||tx<0||ty<0||tx>X_MAX||ty>Y_MAX)return false;
+  long cx=pos_x,cy=pos_y;long dx=std::labs(tx-cx),dy=std::labs(ty-cy);
+  int sx=tx>=cx?1:-1,sy=ty>=cy?1:-1;
+  gpio_set_level(X_DIR,sx>0?1:0);gpio_set_level(Y_DIR,sy>0?1:0);
+  esp_rom_delay_us(10);long total=std::max(dx,dy),ex=0,ey=0;
+  for(long i=0;i<total;i++){
+    if(stop_requested||motor_fault()){abort_motion();return false;}
+    ex+=dx;ey+=dy;bool step_x=false,step_y=false;
+    if(ex>=total){ex-=total;step_x=true;}if(ey>=total){ey-=total;step_y=true;}
+    if((step_x&&sx<0&&x_limit())||(step_y&&sy<0&&y_limit())){abort_motion();return false;}
+    pulse(step_x,step_y,STEP_DELAY_US);
+    if (step_x) {
+    pos_x = pos_x + sx;
+    }
+    if (step_y) {
+    pos_y = pos_y + sy;
+    }
+    if((i%32)==0)taskYIELD();
+  }
+  return true;
+}
+static bool home_axis(gpio_num_t step,gpio_num_t dir,gpio_num_t limit,int direction){
+  gpio_set_level(dir,direction);esp_rom_delay_us(10);
+  if(gpio_get_level(limit)==1)return false;
+  for(int i=0;i<HOME_MAX;i++){
+    if(stop_requested||motor_fault())return false;
+    if(gpio_get_level(limit)==1)return true;
+    gpio_set_level(step,1);esp_rom_delay_us(HOME_DELAY_US);
+    gpio_set_level(step,0);esp_rom_delay_us(HOME_DELAY_US);
+    if((i%16)==0)taskYIELD();
+  }
+  return gpio_get_level(limit)==1;
+}
+static bool home(){
+  homed=false;if(x_limit()||y_limit())return false;
+  if(!motors_on())return false;
+  // Original v0.6 assumes HIGH = positive, so LOW = toward home. Verify mechanically.
+  if(!home_axis(X_STEP,X_DIR,X_LIMIT,0)||!home_axis(Y_STEP,Y_DIR,Y_LIMIT,0)){
+    abort_motion();return false;
+  }
+  pos_x=0;pos_y=0;homed=true;
+  // Keep drivers enabled to retain position after homing.
+  return true;
+}
+static void servo_init(){
+  ledc_timer_config_t t={};t.speed_mode=LEDC_LOW_SPEED_MODE;t.duty_resolution=LEDC_TIMER_14_BIT;
+  t.timer_num=LEDC_TIMER_0;t.freq_hz=50;t.clk_cfg=LEDC_AUTO_CLK;
+  ESP_ERROR_CHECK(ledc_timer_config(&t));
+  for(int i=0;i<2;i++){
+    ledc_channel_config_t c={};c.gpio_num=i==0?PEN_SERVO:GRIP_SERVO;
+    c.speed_mode=LEDC_LOW_SPEED_MODE;c.channel=i==0?LEDC_CHANNEL_0:LEDC_CHANNEL_1;
+    c.intr_type=LEDC_INTR_DISABLE;c.timer_sel=LEDC_TIMER_0;c.duty=0;c.hpoint=0;
+    ESP_ERROR_CHECK(ledc_channel_config(&c));
+  }
+  servos_ready=true;
+}
+static void servo_angle(ledc_channel_t channel,int angle){
+  if(!servos_ready||angle<0||angle>180)return;
+  // Original servo library used 1000-2000 us endpoints at 50 Hz.
+  unsigned pulse_us=1000+(1000*angle)/180;
+  unsigned duty=static_cast<unsigned>((static_cast<uint64_t>(pulse_us)*(1u<<14))/20000u);
+  ledc_set_duty(LEDC_LOW_SPEED_MODE,channel,duty);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE,channel);
+}
+static bool execute(const std::string& s){
+  if(s=="PEN_UP"){servo_angle(LEDC_CHANNEL_0,PEN_UP);return true;}
+  if(s=="PEN_DOWN"){servo_angle(LEDC_CHANNEL_0,PEN_DOWN);return true;}
+  if(s=="GRIP_OPEN"){servo_angle(LEDC_CHANNEL_1,GRIP_OPEN);return true;}
+  if(s=="GRIP_CLOSE"){servo_angle(LEDC_CHANNEL_1,GRIP_CLOSE);return true;}
+  if(s=="HOME")return home();
+  long x=0,y=0;
+  if(std::sscanf(s.c_str(),"MOVE X%ld Y%ld",&x,&y)==2)return move_to(x,y);
+  if(std::sscanf(s.c_str(),"REL X%ld Y%ld",&x,&y)==2)return move_to(pos_x+x,pos_y+y);
+  ESP_LOGW(TAG,"Unknown command: %s",s.c_str());return false;
+}
+static void motion_task(void*){
+  while(true){
+    if(stop_requested){motors_off();homed=false;drawing=false;stop_requested=false;}
+    std::string cmd;
+    xSemaphoreTake(lock,portMAX_DELAY);
+    if(!queue.empty()){cmd=queue.front();queue.pop_front();}
+    xSemaphoreGive(lock);
+    if(!cmd.empty()){
+      drawing=true;ESP_LOGI(TAG,"Execute: %s",cmd.c_str());
+      if(!execute(cmd)){ESP_LOGE(TAG,"Command failed");abort_motion();}
+      drawing=false;
+    }else vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+static esp_err_t reply(httpd_req_t* req,int status,const char* type,const std::string& body){
+  httpd_resp_set_status(req,status==200?"200 OK":status==202?"202 Accepted":status==400?"400 Bad Request":"500 Internal Server Error");
+  httpd_resp_set_type(req,type);return httpd_resp_send(req,body.c_str(),body.size());
+}
+static esp_err_t status_handler(httpd_req_t* req){
+  size_t n;xSemaphoreTake(lock,portMAX_DELAY);n=queue.size();xSemaphoreGive(lock);
+  char body[200];std::snprintf(body,sizeof(body),"{\"firmware\":\"idf-0.1\",\"homed\":%s,\"drawing\":%s,\"x\":%ld,\"y\":%ld,\"queue\":%u}",homed?"true":"false",drawing?"true":"false",pos_x.load(),pos_y.load(),(unsigned)n);
+  return reply(req,200,"application/json",body);
+}
+static bool read_body(httpd_req_t* req,std::string& body,size_t max_bytes){
+  if(req->content_len<=0||static_cast<size_t>(req->content_len)>max_bytes)return false;
+  body.reserve(req->content_len);char buf[256];int left=req->content_len;
+  while(left>0){int n=httpd_req_recv(req,buf,std::min(left,(int)sizeof(buf)));
+    if (n <= 0) {
+    return false;
+    }
+    body.append(buf, n);
+    left -= n;
+  }
+  return true;
+}
+static esp_err_t command_handler(httpd_req_t* req){
+  std::string body;if(!read_body(req,body,COMMAND_MAX+16))return reply(req,400,"text/plain","Missing or oversized command");
+  std::string cmd=normalize(body);
+  if(cmd=="STOP"){request_stop();return reply(req,200,"text/plain","STOP requested");}
+  if(!enqueue(cmd))return reply(req,400,"text/plain","Queue full or invalid command");
+  return reply(req,202,"text/plain","Command queued");
+}
+static esp_err_t draw_handler(httpd_req_t* req){
+  std::string body;if(!read_body(req,body,8192))return reply(req,400,"text/plain","Invalid drawing body (max 8192 bytes)");
+  std::deque<std::string> commands;size_t start=0;
+  while(start<body.size()){
+    size_t end=body.find('\n',start);if(end==std::string::npos)end=body.size();
+    auto cmd=normalize(body.substr(start,end-start));
+    if(!cmd.empty()){
+      if(cmd.size()>COMMAND_MAX||commands.size()>=QUEUE_MAX)return reply(req,400,"text/plain","Invalid or too many commands");
+      commands.push_back(cmd);
+    }
+    start=end+1;
+  }
+  size_t count=commands.size();xSemaphoreTake(lock,portMAX_DELAY);
+  bool fits=queue.size()+count<=QUEUE_MAX;
+  if(fits)for(auto& c:commands)queue.push_back(std::move(c));
+  xSemaphoreGive(lock);
+  if(!fits)return reply(req,400,"text/plain","Queue full");
+  return reply(req,202,"text/plain","Queued "+std::to_string(count)+" commands");
+}
+static esp_err_t stop_handler(httpd_req_t* req){request_stop();return reply(req,200,"text/plain","STOP requested");}
+static void wifi_start(){
+  ESP_ERROR_CHECK(esp_netif_init());ESP_ERROR_CHECK(esp_event_loop_create_default());
+  esp_netif_create_default_wifi_ap();wifi_init_config_t init=WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&init));
+  wifi_config_t cfg={};std::strncpy((char*)cfg.ap.ssid,AP_SSID,sizeof(cfg.ap.ssid));
+  cfg.ap.ssid_len=std::strlen(AP_SSID);
+  std::strncpy((char*)cfg.ap.password,AP_PASS,sizeof(cfg.ap.password));
+  cfg.ap.channel=1;cfg.ap.max_connection=4;cfg.ap.authmode=WIFI_AUTH_WPA2_PSK;
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP,&cfg));ESP_ERROR_CHECK(esp_wifi_start());
+  httpd_config_t hc=HTTPD_DEFAULT_CONFIG();hc.server_port=80;
+  httpd_handle_t server=nullptr;ESP_ERROR_CHECK(httpd_start(&server,&hc));
+  httpd_uri_t status_uri={};status_uri.uri="/status";status_uri.method=HTTP_GET;status_uri.handler=status_handler;
+  httpd_uri_t command_uri={};command_uri.uri="/command";command_uri.method=HTTP_POST;command_uri.handler=command_handler;
+  httpd_uri_t draw_uri={};draw_uri.uri="/draw";draw_uri.method=HTTP_POST;draw_uri.handler=draw_handler;
+  httpd_uri_t stop_uri={};stop_uri.uri="/stop";stop_uri.method=HTTP_POST;stop_uri.handler=stop_handler;
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server,&status_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server,&command_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server,&draw_uri));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server,&stop_uri));
+  ESP_LOGI(TAG,"AP %s started; default address http://192.168.4.1",AP_SSID);
+}
+static void pins_init(){
+  // Set disabled output levels before enabling GPIO outputs.
+  gpio_set_level(X_EN,1);gpio_set_level(Y_EN,1);
+  gpio_config_t out={};out.pin_bit_mask=(1ULL<<X_STEP)|(1ULL<<X_DIR)|(1ULL<<X_EN)|(1ULL<<Y_STEP)|(1ULL<<Y_DIR)|(1ULL<<Y_EN)|(1ULL<<STATUS_LED);
+  out.mode=GPIO_MODE_OUTPUT;out.pull_up_en=GPIO_PULLUP_DISABLE;out.pull_down_en=GPIO_PULLDOWN_DISABLE;out.intr_type=GPIO_INTR_DISABLE;
+  ESP_ERROR_CHECK(gpio_config(&out));motors_off();gpio_set_level(X_STEP,0);gpio_set_level(Y_STEP,0);gpio_set_level(STATUS_LED,0);
+  gpio_config_t in={};in.pin_bit_mask=(1ULL<<X_LIMIT)|(1ULL<<Y_LIMIT)|(1ULL<<X_FAULT)|(1ULL<<Y_FAULT);
+  in.mode=GPIO_MODE_INPUT;in.pull_up_en=GPIO_PULLUP_ENABLE;in.pull_down_en=GPIO_PULLDOWN_DISABLE;in.intr_type=GPIO_INTR_DISABLE;
+  ESP_ERROR_CHECK(gpio_config(&in));
+}
+extern "C" void app_main(){
+  esp_err_t err=nvs_flash_init();if(err==ESP_ERR_NVS_NO_FREE_PAGES||err==ESP_ERR_NVS_NEW_VERSION_FOUND){
+    ESP_ERROR_CHECK(nvs_flash_erase());err=nvs_flash_init();}ESP_ERROR_CHECK(err);
+  lock=xSemaphoreCreateMutex();configASSERT(lock);
+  pins_init();servo_init();servo_angle(LEDC_CHANNEL_0,PEN_UP);servo_angle(LEDC_CHANNEL_1,GRIP_OPEN);
+  xTaskCreate(motion_task,"motion",8192,nullptr,5,nullptr);
+  wifi_start();ESP_LOGI(TAG,"Native ESP-IDF StepperPlotter ready");
+}
